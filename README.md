@@ -1,6 +1,9 @@
 # homeassistant-uponor
 
-[![Buy me a smoothie](https://img.shields.io/badge/Buy%20me%20a-smoothie-blue?style=for-the-badge&logo=PAYPAL)](https://www.paypal.me/asev)
+[![Validate](https://github.com/chechirecat/homeassistant-uponor/actions/workflows/validate.yml/badge.svg)](https://github.com/chechirecat/homeassistant-uponor/actions/workflows/validate.yml)
+
+Actively maintained continuation of [asev/homeassistant-uponor](https://github.com/asev/homeassistant-uponor),
+originally written by Aivaras Sevelevicius.
 
 Uponor Smatrix Pulse heating/cooling integration for Home Assistant.
 
@@ -14,7 +17,14 @@ It should work with all controllers that support this module.
 1. Setup and configure your system on Uponor Smatrix mobile app. Make sure you are able to control temperature via the app.
 Your Uponor has to be connected to the local network and you should know it's IP address.
 
-2. Install "Uponor Smatrix Pulse" integration on HACS
+2. In HACS, add `https://github.com/chechirecat/homeassistant-uponor` as a custom repository
+(category: Integration) and install "Uponor Smatrix Pulse".
+
+### Migrating from asev/homeassistant-uponor
+
+Remove the old repository in HACS (keep the integration configured), add this repository as above,
+install it and restart Home Assistant. The domain, config entry, entity IDs and unique IDs are unchanged,
+so existing entities, automations and history are kept.
 
 OR copy the custom_components folder to your own Home Assistant /config folder.
 
@@ -54,6 +64,13 @@ and to the maximum (default 35℃) when cooling mode is active.
 ## Older module
 
 In case you have older Uponor X-165 module visit: https://github.com/dave-code-ruiz/uhomeuponor
+
+## Development
+
+```bash
+pip install -r requirements_test.txt
+pytest
+```
 
 ## Feedback
 

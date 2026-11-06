@@ -1,41 +1,50 @@
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.core import callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-
 from homeassistant.const import CONF_NAME
-from .const import (
-    DOMAIN,
-    SIGNAL_UPONOR_STATE_UPDATE,
-    DEVICE_MANUFACTURER
-)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
+from . import UponorConfigEntry
+from .const import DOMAIN, DEVICE_MANUFACTURER
 
 
-async def async_setup_entry(hass, entry, async_add_entities):
-    state_proxy = hass.data[DOMAIN]["state_proxy"]
-    entities = [AwaySwitch(state_proxy, entry.data[CONF_NAME])]
+async def async_setup_entry(
+    hass: HomeAssistant, entry: UponorConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
+    runtime = entry.runtime_data
+    state_proxy = runtime.state_proxy
+    name = entry.data[CONF_NAME]
+    entities = [AwaySwitch(runtime.coordinator, state_proxy, name)]
 
     if state_proxy.is_cool_available():
-        entities.append(CoolSwitch(state_proxy, entry.data[CONF_NAME]))
+        entities.append(CoolSwitch(runtime.coordinator, state_proxy, name))
 
     async_add_entities(entities)
 
 
-class AwaySwitch(SwitchEntity):
-    def __init__(self, state_proxy, name):
+class UponorSystemSwitch(CoordinatorEntity, SwitchEntity):
+    """Base for switches attached to the whole Uponor system device."""
+
+    _name_suffix = ""
+
+    def __init__(self, coordinator, state_proxy, name):
+        super().__init__(coordinator)
         self._state_proxy = state_proxy
-        self._name = name
+        self._attr_name = f"{name} {self._name_suffix}"
+        # Kept identical to earlier releases so existing entity registry entries survive.
+        self._attr_unique_id = self._attr_name
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, "c")},
+            name=name,
+            manufacturer=DEVICE_MANUFACTURER,
+            model=state_proxy.get_model(),
+        )
 
-    @property
-    def name(self) -> str:
-        return self._name + " Away"
 
-    @property
-    def icon(self):
-        return "mdi:home-export-outline"
-
-    @property
-    def should_poll(self):
-        return False
+class AwaySwitch(UponorSystemSwitch):
+    _name_suffix = "Away"
+    _attr_icon = "mdi:home-export-outline"
 
     @property
     def is_on(self):
@@ -46,46 +55,11 @@ class AwaySwitch(SwitchEntity):
 
     async def async_turn_off(self, **kwargs):
         await self._state_proxy.async_set_away(False)
-    
-    async def async_added_to_hass(self):
-        async_dispatcher_connect(
-            self.hass, SIGNAL_UPONOR_STATE_UPDATE, self._update_callback
-        )
-
-    @callback
-    def _update_callback(self):
-        self.async_schedule_update_ha_state(True)
-
-    @property
-    def unique_id(self):
-        return self.name
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, "c")},
-            "name": self._name,
-            "manufacturer": DEVICE_MANUFACTURER,
-            "model": self._state_proxy.get_model(),
-        }
 
 
-class CoolSwitch(SwitchEntity):
-    def __init__(self, state_proxy, name):
-        self._state_proxy = state_proxy
-        self._name = name
-
-    @property
-    def name(self) -> str:
-        return self._name + " Cooling Mode"
-
-    @property
-    def icon(self):
-        return "mdi:snowflake"
-
-    @property
-    def should_poll(self):
-        return False
+class CoolSwitch(UponorSystemSwitch):
+    _name_suffix = "Cooling Mode"
+    _attr_icon = "mdi:snowflake"
 
     @property
     def is_on(self):
@@ -96,25 +70,3 @@ class CoolSwitch(SwitchEntity):
 
     async def async_turn_off(self, **kwargs):
         await self._state_proxy.async_switch_to_heating()
-    
-    async def async_added_to_hass(self):
-        async_dispatcher_connect(
-            self.hass, SIGNAL_UPONOR_STATE_UPDATE, self._update_callback
-        )
-
-    @callback
-    def _update_callback(self):
-        self.async_schedule_update_ha_state(True)
-
-    @property
-    def unique_id(self):
-        return self.name
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, "c")},
-            "name": self._name,
-            "manufacturer": DEVICE_MANUFACTURER,
-            "model": self._state_proxy.get_model(),
-        }

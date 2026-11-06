@@ -1,12 +1,13 @@
 {
   "domain": "uponor",
   "name": "Uponor",
-  "documentation": "https://github.com/asev/homeassistant-uponor",
-  "issue_tracker": "https://github.com/asev/homeassistant-uponor/issues",
-  "version": "0.9.2",
+  "codeowners": ["@chechirecat"],
   "config_flow": true,
   "dependencies": [],
-  "codeowners": ["@asev"],
-  "requirements": ["UponorJnap==0.1"]
+  "documentation": "https://github.com/chechirecat/homeassistant-uponor",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/chechirecat/homeassistant-uponor/issues",
+  "requirements": [],
+  "version": "1.0.0"
 }
-

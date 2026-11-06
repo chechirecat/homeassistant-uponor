@@ -1,117 +1,83 @@
-import logging
-
-from homeassistant.components.climate import ClimateEntity
-from homeassistant.core import callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-
-from homeassistant.const import (
-    ATTR_TEMPERATURE,
-    UnitOfTemperature
-)
-
-from homeassistant.components.climate.const import (
-    HVACMode,
-    HVACAction,
+from homeassistant.components.climate import (
     PRESET_AWAY,
     PRESET_ECO,
-    ClimateEntityFeature
+    ClimateEntity,
+    ClimateEntityFeature,
+    HVACAction,
+    HVACMode,
 )
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import (
-    DOMAIN,
-    SIGNAL_UPONOR_STATE_UPDATE,
-    DEVICE_MANUFACTURER
-)
-
-_LOGGER = logging.getLogger(__name__)
+from . import UponorConfigEntry
+from .const import DOMAIN, DEVICE_MANUFACTURER
 
 
-async def async_setup_entry(hass, entry, async_add_entities):
-    state_proxy = hass.data[DOMAIN]["state_proxy"]
+async def async_setup_entry(
+    hass: HomeAssistant, entry: UponorConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
+    runtime = entry.runtime_data
+    state_proxy = runtime.state_proxy
 
     entities = []
-    for thermostat in hass.data[DOMAIN]["thermostats"]:
+    for thermostat in runtime.thermostats:
         if thermostat.lower() in entry.data:
             name = entry.data[thermostat.lower()]
         else:
             name = state_proxy.get_room_name(thermostat)
-        entities.append(UponorClimate(state_proxy, thermostat, name))
-    if entities:
-        async_add_entities(entities, update_before_add=False)
+        entities.append(UponorClimate(runtime.coordinator, state_proxy, thermostat, name))
+    async_add_entities(entities)
 
 
-class UponorClimate(ClimateEntity):
+class UponorClimate(CoordinatorEntity, ClimateEntity):
 
-    _enable_turn_on_off_backwards_compatibility = False
-    
-    def __init__(self, state_proxy, thermostat, name):
+    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.PRESET_MODE
+        | ClimateEntityFeature.TURN_OFF
+        | ClimateEntityFeature.TURN_ON
+    )
+
+    def __init__(self, coordinator, state_proxy, thermostat, name):
+        super().__init__(coordinator)
         self._state_proxy = state_proxy
         self._thermostat = thermostat
-        self._name = name
-        temp = self._state_proxy.get_setpoint(self._thermostat)
-        is_cool = self._state_proxy.is_cool_enabled()
-        self._is_on = not ((is_cool and temp >= self.max_temp) or (not is_cool and temp <= self.min_temp))
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._state_proxy.get_thermostat_id(self._thermostat))},
-            "name": self._name,
-            "manufacturer": DEVICE_MANUFACTURER,
-            "model": self._state_proxy.get_model(),
-            "sw_version": self._state_proxy.get_version(self._thermostat)
-        }
-
-    @property
-    def name(self):
-        return self._name
-    
-    @property
-    def should_poll(self):
-        return False
-
-    async def async_added_to_hass(self):
-        async_dispatcher_connect(
-            self.hass, SIGNAL_UPONOR_STATE_UPDATE, self._update_callback
+        self._attr_name = name
+        self._attr_unique_id = state_proxy.get_thermostat_id(thermostat)
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, self._attr_unique_id)},
+            name=name,
+            manufacturer=DEVICE_MANUFACTURER,
+            model=state_proxy.get_model(),
+            sw_version=state_proxy.get_version(thermostat),
         )
 
-    @callback
-    def _update_callback(self):
-        temp = self._state_proxy.get_setpoint(self._thermostat)
-        is_cool = self._state_proxy.is_cool_enabled()
-        self._is_on = not ((is_cool and temp >= self.max_temp) or (not is_cool and temp <= self.min_temp))
-        self.async_schedule_update_ha_state(True)
+    @property
+    def _is_on(self):
+        return self._state_proxy.is_on(self._thermostat)
 
-    @property
-    def unique_id(self):
-        return self._state_proxy.get_thermostat_id(self._thermostat)
-    
-    @property
-    def temperature_unit(self):
-        return UnitOfTemperature.CELSIUS
-
-    @property
-    def supported_features(self):
-        return ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TURN_ON
-        
     @property
     def hvac_modes(self):
         if self._state_proxy.is_cool_enabled():
             return [HVACMode.COOL, HVACMode.OFF]
         return [HVACMode.HEAT, HVACMode.OFF]
-    
+
     @property
     def preset_modes(self):
         return [self.preset_mode] if self.preset_mode is not None else []
-    
+
     @property
     def current_humidity(self):
         return self._state_proxy.get_humidity(self._thermostat)
-    
+
     @property
     def current_temperature(self):
         return self._state_proxy.get_temperature(self._thermostat)
-    
+
     @property
     def target_temperature(self):
         return self._state_proxy.get_setpoint(self._thermostat)
@@ -123,7 +89,7 @@ class UponorClimate(ClimateEntity):
     @property
     def max_temp(self):
         return self._state_proxy.get_max_limit(self._thermostat)
-    
+
     @property
     def extra_state_attributes(self):
         return {
@@ -141,7 +107,7 @@ class UponorClimate(ClimateEntity):
         if self._state_proxy.is_away():
             return PRESET_AWAY
         return None
-    
+
     @property
     def hvac_mode(self):
         if not self._is_on:
@@ -157,28 +123,22 @@ class UponorClimate(ClimateEntity):
         if self._state_proxy.is_active(self._thermostat):
             return HVACAction.COOLING if self._state_proxy.is_cool_enabled() else HVACAction.HEATING
         return HVACAction.IDLE
-    
+
     async def async_turn_off(self):
         if self._is_on:
             await self._state_proxy.async_turn_off(self._thermostat)
-            self._is_on = False
 
     async def async_turn_on(self):
         if not self._is_on:
             await self._state_proxy.async_turn_on(self._thermostat)
-            self._is_on = True
 
     async def async_set_hvac_mode(self, hvac_mode):
-        if hvac_mode == HVACMode.OFF and self._is_on:
-            await self._state_proxy.async_turn_off(self._thermostat)
-            self._is_on = False
-        if (hvac_mode == HVACMode.HEAT or hvac_mode == HVACMode.COOL) and not self._is_on:
-            await self._state_proxy.async_turn_on(self._thermostat)
-            self._is_on = True
+        if hvac_mode == HVACMode.OFF:
+            await self.async_turn_off()
+        elif hvac_mode in (HVACMode.HEAT, HVACMode.COOL):
+            await self.async_turn_on()
 
     async def async_set_temperature(self, **kwargs):
         if kwargs.get(ATTR_TEMPERATURE) is None:
             return
         await self._state_proxy.set_setpoint(self._thermostat, kwargs.get(ATTR_TEMPERATURE))
-
-

@@ -1,20 +1,27 @@
-import math
+"""Uponor Smatrix Pulse integration."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 import logging
+import math
 
-from homeassistant.core import HomeAssistant
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+import voluptuous as vol
 
-from homeassistant.const import CONF_HOST
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.const import CONF_HOST, Platform
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
-from UponorJnap import UponorJnap
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 import homeassistant.util.dt as dt_util
 
+from .api import UponorApiError, UponorJnapClient
 from .const import (
     DOMAIN,
-    SIGNAL_UPONOR_STATE_UPDATE,
     SCAN_INTERVAL,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -36,60 +43,118 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.CLIMATE, Platform.SWITCH]
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-async def async_setup(hass: HomeAssistant, config: dict):
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN]["config"] = config.get(DOMAIN) or {}
+SERVICE_SET_VARIABLE = "set_variable"
+SERVICE_SET_VARIABLE_SCHEMA = vol.Schema(
+    {
+        vol.Required("var_name"): cv.string,
+        vol.Required("var_value"): cv.string,
+    }
+)
+
+
+@dataclass
+class UponorRuntimeData:
+    """Objects shared by the platforms of one config entry."""
+
+    coordinator: UponorCoordinator
+    state_proxy: UponorStateProxy
+    thermostats: list[str]
+
+
+type UponorConfigEntry = ConfigEntry[UponorRuntimeData]
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register integration-wide services."""
+
+    async def handle_set_variable(call: ServiceCall) -> None:
+        entries = [
+            entry
+            for entry in hass.config_entries.async_entries(DOMAIN)
+            if entry.state is ConfigEntryState.LOADED
+        ]
+        if not entries:
+            raise ServiceValidationError("No loaded Uponor config entry")
+        await entries[0].runtime_data.state_proxy.async_set_variable(
+            call.data["var_name"], call.data["var_value"]
+        )
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_VARIABLE, handle_set_variable, schema=SERVICE_SET_VARIABLE_SCHEMA
+    )
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
-    host = config_entry.data[CONF_HOST]
-    store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+async def async_setup_entry(hass: HomeAssistant, config_entry: UponorConfigEntry) -> bool:
+    client = UponorJnapClient(async_get_clientsession(hass), config_entry.data[CONF_HOST])
+    coordinator = UponorCoordinator(hass, config_entry, client)
+    # Raises ConfigEntryNotReady on failure, so HA retries setup later.
+    await coordinator.async_config_entry_first_refresh()
 
-    state_proxy = await hass.async_add_executor_job(lambda: UponorStateProxy(hass, host, store))
-    await state_proxy.async_update()
-    thermostats = state_proxy.get_active_thermostats()
-
-    hass.data[DOMAIN] = {
-        "state_proxy": state_proxy,
-        "thermostats": thermostats
-    }
-
-    def handle_set_variable(call):
-        var_name = call.data.get('var_name')
-        var_value = call.data.get('var_value')
-        hass.data[DOMAIN]['state_proxy'].set_variable(var_name, var_value)
-
-    hass.services.async_register(DOMAIN, "set_variable", handle_set_variable)
+    state_proxy = UponorStateProxy(
+        hass, client, coordinator, Store(hass, STORAGE_VERSION, STORAGE_KEY)
+    )
+    config_entry.runtime_data = UponorRuntimeData(
+        coordinator=coordinator,
+        state_proxy=state_proxy,
+        thermostats=state_proxy.get_active_thermostats(),
+    )
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
-
-    async_track_time_interval(hass, state_proxy.async_update, SCAN_INTERVAL)
-
     config_entry.async_on_unload(config_entry.add_update_listener(async_update_options))
-
     return True
 
-async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
+
+async def async_update_options(hass: HomeAssistant, entry: UponorConfigEntry) -> None:
     """Update options."""
-    _LOGGER.debug("Update setup entry: %s, data: %s, options: %s", entry.entry_id, entry.data, entry.options)
     await hass.config_entries.async_reload(entry.entry_id)
 
-async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+
+async def async_unload_entry(hass: HomeAssistant, config_entry: UponorConfigEntry) -> bool:
     """Unload a config entry."""
-    _LOGGER.debug("Unloading setup entry: %s, data: %s, options: %s", config_entry.entry_id, config_entry.data, config_entry.options)
-    unload_ok = await hass.config_entries.async_unload_platforms(config_entry, [Platform.SWITCH, Platform.CLIMATE])
-    return unload_ok
+    return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
+
+
+class UponorCoordinator(DataUpdateCoordinator[dict[str, str]]):
+    """Polls the controller for all variables."""
+
+    def __init__(
+        self, hass: HomeAssistant, config_entry: ConfigEntry, client: UponorJnapClient
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=config_entry,
+            name=DOMAIN,
+            update_interval=SCAN_INTERVAL,
+        )
+        self.client = client
+        self.last_update = None
+
+    async def _async_update_data(self) -> dict[str, str]:
+        try:
+            data = await self.client.get_data()
+        except UponorApiError as err:
+            raise UpdateFailed(str(err)) from err
+        self.last_update = dt_util.now()
+        return data
+
 
 class UponorStateProxy:
-    def __init__(self, hass, host, store):
+    """Translates raw controller variables into thermostat state."""
+
+    def __init__(self, hass, client, coordinator, store):
         self._hass = hass
-        self._client = UponorJnap(host)
+        self._client = client
+        self._coordinator = coordinator
         self._store = store
-        self._data = {}
         self._storage_data = {}
-        self.next_sp_from_dt = None
+
+    @property
+    def _data(self) -> dict[str, str]:
+        return self._coordinator.data
 
     # Thermostats config
 
@@ -176,6 +241,17 @@ class UponorStateProxy:
 
     # State
 
+    def is_on(self, thermostat):
+        """Uponor has no real 'off'; off means setpoint parked at the min/max limit."""
+        temp = self.get_setpoint(thermostat)
+        if temp is None:
+            return True
+        if self.is_cool_enabled():
+            max_temp = self.get_max_limit(thermostat)
+            return max_temp is None or temp < max_temp
+        min_temp = self.get_min_limit(thermostat)
+        return min_temp is None or temp > min_temp
+
     def is_active(self, thermostat):
         var = thermostat + '_stat_cb_actuator'
         if var in self._data:
@@ -190,7 +266,7 @@ class UponorStateProxy:
         var = thermostat + '_stat_battery_error'
         if var in self._data and self._data[var] == "1":
             return STATUS_ERROR_BATTERY
-        var = thermostat + '_stat_valve_position_err"'
+        var = thermostat + '_stat_valve_position_err'
         if var in self._data and self._data[var] == "1":
             return STATUS_ERROR_VALVE
         var = thermostat[0:3] + 'stat_general_system_alarm'
@@ -219,27 +295,21 @@ class UponorStateProxy:
     # HVAC modes
 
     async def async_switch_to_cooling(self):
-        for thermostat in self._hass.data[DOMAIN]['thermostats']:
+        for thermostat in self._thermostats():
             if self.get_setpoint(thermostat) == self.get_min_limit(thermostat):
                 await self.set_setpoint(thermostat, self.get_max_limit(thermostat))
-        
-        await self._hass.async_add_executor_job(lambda: self._client.send_data({'sys_heat_cool_mode': '1'}))
-        self._data['sys_heat_cool_mode'] = '1'
-        self._hass.async_add_job(async_dispatcher_send, self._hass, SIGNAL_UPONOR_STATE_UPDATE)
+        await self._async_send({'sys_heat_cool_mode': '1'})
 
     async def async_switch_to_heating(self):
-        for thermostat in self._hass.data[DOMAIN]['thermostats']:
+        for thermostat in self._thermostats():
             if self.get_setpoint(thermostat) == self.get_max_limit(thermostat):
                 await self.set_setpoint(thermostat, self.get_min_limit(thermostat))
-
-        await self._hass.async_add_executor_job(lambda: self._client.send_data({'sys_heat_cool_mode': '0'}))
-        self._data['sys_heat_cool_mode'] = '0'
-        self._hass.async_add_job(async_dispatcher_send, self._hass, SIGNAL_UPONOR_STATE_UPDATE)
+        await self._async_send({'sys_heat_cool_mode': '0'})
 
     async def async_turn_on(self, thermostat):
         data = await self._store.async_load()
         self._storage_data = {} if data is None else data
-        last_temp = self._storage_data[thermostat] if thermostat in self._storage_data else DEFAULT_TEMP
+        last_temp = self._storage_data.get(thermostat, DEFAULT_TEMP)
         await self.set_setpoint(thermostat, last_temp)
 
     async def async_turn_off(self, thermostat):
@@ -269,11 +339,7 @@ class UponorStateProxy:
         return var in self._data and self._data[var] == "1"
 
     async def async_set_away(self, is_away):
-        var = 'sys_forced_eco_mode'
-        data = "1" if is_away else "0"
-        await self._hass.async_add_executor_job(lambda: self._client.send_data({var: data}))
-        self._data[var] = data
-        self._hass.async_add_job(async_dispatcher_send, self._hass, SIGNAL_UPONOR_STATE_UPDATE)
+        await self._async_send({'sys_forced_eco_mode': "1" if is_away else "0"})
 
     def is_eco(self, thermostat):
         if self.get_eco_setback(thermostat) == 0:
@@ -287,28 +353,30 @@ class UponorStateProxy:
         var = thermostat + '_eco_offset'
         if var in self._data:
             return round(int(self._data[var]) / 18, 1)
-        
-    def get_last_update(self):
-        return self.next_sp_from_dt
 
-    # Rest
-    async def async_update(self,_=None):
-        try:
-            self.next_sp_from_dt = dt_util.now()
-            self._data = await self._hass.async_add_executor_job(lambda: self._client.get_data())
-            self._hass.async_add_job(async_dispatcher_send, self._hass, SIGNAL_UPONOR_STATE_UPDATE)
-        except Exception as ex:
-            _LOGGER.error("Uponor thermostat was unable to update: %s", ex)
-        
-    def set_variable(self, var_name, var_value):
-        _LOGGER.debug("Called set variable: name: %s, value: %s, data: %s", var_name, var_value, self._data)
-        self._client.send_data({var_name: var_value})
-        self._data[var_name] = var_value
-        self._hass.async_add_job(async_dispatcher_send, self._hass, SIGNAL_UPONOR_STATE_UPDATE)
+    def get_last_update(self):
+        return self._coordinator.last_update
+
+    # Writes
+
+    async def async_set_variable(self, var_name, var_value):
+        _LOGGER.debug("Called set variable: name: %s, value: %s", var_name, var_value)
+        await self._async_send({var_name: var_value})
 
     async def set_setpoint(self, thermostat, temp):
         var = thermostat + '_setpoint'
         setpoint = int(temp * 18 + self.get_active_setback(thermostat, temp) + 320)
-        await self._hass.async_add_executor_job(lambda: self._client.send_data({var: setpoint}))
-        self._data[var] = setpoint
-        self._hass.async_add_job(async_dispatcher_send, self._hass, SIGNAL_UPONOR_STATE_UPDATE)
+        await self._async_send({var: setpoint})
+
+    def _thermostats(self):
+        return self._coordinator.config_entry.runtime_data.thermostats
+
+    async def _async_send(self, data):
+        try:
+            await self._client.send_data(data)
+        except UponorApiError as err:
+            raise HomeAssistantError(f"Failed to update Uponor controller: {err}") from err
+        # Optimistically apply the write so the UI reflects it before the next poll.
+        for key, value in data.items():
+            self._data[key] = str(value)
+        self._coordinator.async_update_listeners()
