@@ -72,6 +72,14 @@ pip install -r requirements_test.txt
 pytest
 ```
 
+## Releasing
+
+Releases are fully automated: open **Actions → Release → Run workflow** on the default branch and pick
+`patch`, `minor` or `major`. The workflow runs hassfest, the HACS check and the tests, bumps
+`manifest.json`, tags `vX.Y.Z`, builds `uponor.zip` and publishes a GitHub release with generated notes.
+If `manifest.json` already holds a version that has no tag yet (e.g. the first `1.0.0`), that version is
+released as is.
+
 ## Feedback
 
 Your feedback, pull requests or any other contribution are welcome.

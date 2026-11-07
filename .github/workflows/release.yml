@@ -1,0 +1,83 @@
+name: Release
+
+# One click in the Actions tab: validates, bumps the version, tags, builds the
+# HACS zip and publishes a GitHub release with auto-generated notes.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump (ignored if manifest.json holds a version that is not tagged yet)"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+
+  release:
+    needs: validate
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    env:
+      MANIFEST: custom_components/uponor/manifest.json
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          current="$(jq -r .version "$MANIFEST")"
+          last="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          if ! git rev-parse -q --verify "refs/tags/v${current}" >/dev/null; then
+            version="$current"
+          else
+            IFS=. read -r major minor patch <<< "${last#v}"
+            case "${{ inputs.bump }}" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="${major}.$((minor + 1)).0" ;;
+              patch) version="${major}.${minor}.$((patch + 1))" ;;
+            esac
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version '$version'"; exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            echo "::error::Tag v${version} already exists"; exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Releasing v${version} (previous tag: ${last:-none})"
+
+      - name: Commit version bump and tag
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "$(jq -r .version "$MANIFEST")" != "$version" ]; then
+            jq --arg v "$version" '.version = $v' "$MANIFEST" > manifest.tmp
+            mv manifest.tmp "$MANIFEST"
+            git commit -am "chore: release v${version}"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
+          git tag "v${version}"
+          git push origin "v${version}"
+
+      - name: Build zip
+        run: cd custom_components/uponor && zip -r ../../uponor.zip . -x '__pycache__/*'
+
+      - name: Publish release
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" uponor.zip \
+            --title "v${{ steps.version.outputs.version }}" \
+            --generate-notes \
+            --verify-tag
